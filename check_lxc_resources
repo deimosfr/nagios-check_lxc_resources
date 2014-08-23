@@ -1,0 +1,224 @@
+#!/usr/bin/perl
+#===============================================================================
+#
+#         FILE:  check_lxc_resources
+#
+#        USAGE:   check_lxc_resources -h <container> -n <namespace> -w <warning%> -c <critical%>
+#					-p : set path of BackupPC_serverMesg binary file (default is /usr/share/backuppc/bin/BackupPC_serverMesg)
+#					-h : specify a hostname from backuppc to check (if unset, all hosts will be checked)
+#
+#  DESCRIPTION:  Nagios plugins to check backups from BackupPC software
+#
+# REQUIREMENTS:  ---
+#        NOTES:  ---
+#      LICENSE:  GPLv2 License
+#       AUTHOR:  Pierre Mavro (), <deimos@deimos.fr>
+#      VERSION:  0.1
+#      CREATED:  05/08/2014
+#===============================================================================
+
+use strict;
+use POSIX;
+use Getopt::Long;
+
+my $debug=0;
+
+sub print_debug() {
+    my $message=shift;
+    print "$message\n" if ($debug == 1);
+}
+
+# Return properly formated messages to Nagios
+sub return_nagios() {
+    my $message = shift;
+    my $code = shift;
+
+    print "$message\n";
+    &help if ($code == 3);
+    exit($code);
+}
+
+# check if container exist and is running
+sub check_container_exist() {
+    my $container = shift;
+    my $lxc_cgroup_path = shift;
+    my $container_path="$lxc_cgroup_path/$container";
+
+    &print_debug("Container path: $container_path");
+
+    # Check container is alive
+    unless (-d $container_path) {
+        &return_nagios("$container container is not alive or does not exists",2);
+    }
+    &print_debug("Container path exists !");
+}
+
+sub check_percent() {
+    my $number = shift;
+    unless ($number >= 0 and $number <= 100) {
+        &return_nagios('You need to set a correct percentage value (between 0 an 100)',3);
+    }
+}
+
+sub get_all_containers() {
+    my $container = shift;
+    my $lxc_cgroup_path = shift;
+    my @all_containers;
+
+    # detect if we need to apply the check on all containers
+    if ($container eq 'all') {
+        @all_containers = glob "$lxc_cgroup_path/*";
+    } else {
+        push @all_containers, $container;
+    }
+    return \@all_containers;
+}
+
+# Check memory usage
+sub check_mem() {
+    my ($lxc_cgroup_path,$container,$namespace) = @_;
+    &print_debug("check_mem args: $lxc_cgroup_path,$container,$namespace");
+    my $memory_usage=0;
+    my $mem_file="$lxc_cgroup_path/$container/$namespace";
+    &print_debug("$container: $mem_file");
+
+    # get current usage
+    open(CUR, "<$mem_file") or &return_nagios("Can't read $mem_file file", 1);
+    while (<CUR>) {
+        chomp $_;
+        $memory_usage=$_;
+    }
+    close(CUR);
+    return $memory_usage;
+}
+
+sub get_memory_usage() {
+    my ($lxc_cgroup_path,$container,$namespace,$warning,$critical) = @_;
+    &print_debug("memory usage args: @_");
+    my ($current_memory,$limited_memory,$nagios_return,$percentage_usage);
+
+    # cgroup namespace file
+    my $lxc_mem_usage='memory.usage_in_bytes';
+    my $lxc_mem_limit='memory.limit_in_bytes';
+    my $lxc_swap_usage='memory.memsw.usage_in_bytes';
+    my $lxc_swap_limit='memory.memsw.limit_in_bytes';
+
+    # Get LXC memory information
+    my $lxc_current_memory=&check_mem($lxc_cgroup_path,$container,$lxc_mem_usage);
+    my $lxc_limited_memory=&check_mem($lxc_cgroup_path,$container,$lxc_mem_limit);
+    &print_debug("Current memory usage: $lxc_current_memory");
+    &print_debug("Current memory limit $lxc_limited_memory");
+
+    # Get container RSS
+    my $rss_mem=0;
+    open (RSS, "sudo /usr/bin/lxc-attach -n $container -- ps -eo rss |");
+    while(<RSS>){
+        chomp;
+        if ($_ != 0) {
+            $rss_mem+=$_;
+        }
+    }
+    close(RSS);
+    $rss_mem=$rss_mem*1024;
+    &print_debug("Total RSS mem: $rss_mem");
+
+    # Get LXC swap information
+    if ($namespace eq 'swap') {
+        my $lxc_current_swap=&check_mem($lxc_cgroup_path,$container,$lxc_swap_usage);
+        my $lxc_limited_swap=&check_mem($lxc_cgroup_path,$container,$lxc_swap_limit);
+        &print_debug("Current swap usage: $lxc_current_swap");
+        &print_debug("Current swap limit $lxc_limited_swap");
+        $current_memory=$lxc_current_swap - $lxc_current_memory;
+        $limited_memory=$lxc_limited_swap - $lxc_limited_memory;
+    } else {
+        $current_memory=$rss_mem;
+        $limited_memory=$lxc_limited_memory;
+    }
+
+    # Calculate percentage
+    my $mem_free = $limited_memory - $current_memory;
+    # avoid division by 0
+    if ($limited_memory != 0) {
+        $percentage_usage = ($current_memory / $limited_memory) * 100;
+    } else {
+        $percentage_usage=0;
+    }
+
+    if ($percentage_usage >= $critical) {
+        $nagios_return=2;
+    } elsif ($percentage_usage >= $warning) {
+        $nagios_return=1;
+    } else {
+        $nagios_return=0;
+    }
+    if ($namespace ne 'swap') {
+        &return_nagios(sprintf("%s usage is %.2f%% (%dM/%dM) / %dM free / %dM cached|%s=%d;%d;%d;0;100",$namespace, $percentage_usage, $current_memory/1024/1024, $limited_memory/1024/1024, $mem_free/1024/1024, ($lxc_current_memory-$rss_mem)/1024/1024 , $namespace, $percentage_usage, $warning, $critical),$nagios_return);
+    } else {
+        &return_nagios(sprintf("%s usage is %.2f%% (%dM/%dM) / %dM free|%s=%d;%d;%d;0;100",$namespace, $percentage_usage, $current_memory/1024/1024, $limited_memory/1024/1024, $mem_free/1024/1024, $namespace, $percentage_usage, $warning, $critical),$nagios_return);
+    }
+}
+
+sub check_opts
+{
+	# Vars
+	my $lxc_cgroup_path = '/sys/fs/cgroup/lxc';
+    my @types = ('memory', 'swap');
+    my ($warning, $critical, $type, $container);
+
+	# Set options
+	GetOptions( "help" => \&help,
+				"h=s"  => \$container,
+				"w=i"  => \$warning,
+				"c=i"  => \$critical,
+				"d"    => \$debug,
+                "l=s"  => \$lxc_cgroup_path,
+				"n=s"  => \$type);
+
+    # Check that lxc cgroup folder exists
+    unless (-d $lxc_cgroup_path) {
+        &return_nagios("$lxc_cgroup_path folder is not present. Be sure you've mounted cgroups filesystem",3);
+    }
+
+    # Check if container exist and is running
+    if (defined($container)) {
+	    &check_container_exist($container,$lxc_cgroup_path);
+    } else {
+        &return_nagios('container name needs to be fullfil',3);
+    }
+
+    # check if namespace is supported
+    my $namespace_support=0;
+    foreach(@types){
+        if ($type eq $_) {
+            $namespace_support=1;
+            last;
+        }
+    }
+    if ($namespace_support == 0) {
+        &return_nagios("'$type' is not supported or empty", 3);
+    }
+
+    # check if critical and warning are fulfill
+    &return_nagios("$warning is not defined", 3) unless (defined($warning));
+    &return_nagios("$critical is not defined", 3) unless (defined($critical));
+    &check_percent($warning);
+    &check_percent($critical);
+
+    # Perform required check
+    &get_memory_usage($lxc_cgroup_path,$container,$type,$warning,$critical) if ($type eq 'memory');
+    &get_memory_usage($lxc_cgroup_path,$container,$type,$warning,$critical) if ($type eq 'swap');
+}
+
+sub help
+{
+	print "Usage : check_lxc_resources -h <container> -n <namespace> -w <warning%> -c <critical%> [-d]\n";
+	print "\t-h : set container name\n";
+	print "\t-n : set container namespace to check (memory|swap)\n";
+	print "\t-w : set warning percent alert\n";
+	print "\t-c : set critical percent alert\n";
+	print "\t-d : debug mode\n";
+	print "\t-help : print this message\n";
+    exit(-1);
+}
+
+&check_opts;
