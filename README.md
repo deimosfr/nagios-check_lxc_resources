@@ -16,6 +16,14 @@ Usage : check_lxc_resources -h <container> -n <namespace> -w <warning%> -c <crit
     -d : debug mode
     -help : print this message
 ```
+Output will looks like this for memory:
+```
+memory usage is 42.95% (219M/512M) / 292M free / 177M cached
+```
+And like this for swap:
+```
+swap usage is 0.02% (0M/464M) / 463M free
+```
 
 Configuration
 -------------
