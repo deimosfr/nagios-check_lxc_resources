@@ -52,7 +52,7 @@ define service{
 }
 ```
 And then you can declare to your hosts:
-
+```
 define host{
     use                     generic-host,host-pnp
     host_name               hostname.domain.com
